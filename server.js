@@ -1,13 +1,17 @@
 const http = require("http");
 
 const PORT = process.env.PORT || 3000;
-const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL; // אופציונלי אם השרת משמש רק להעיר שרת אחר
-const PEER_WAKE_URL = process.env.PEER_WAKE_URL;     // כתובת השרת השני ב-Render להערה (אופציונלי)
+const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL;
+const PEER_WAKE_URL = process.env.PEER_WAKE_URL;
 const TIME_ZONE = "Asia/Jerusalem";
 
-const FAST_INTERVAL_MS = 10000;  // כל 10 שניות
-const SLOW_INTERVAL_MS = 60000;  // כל דקה אחת
-const WAKE_PEER_INTERVAL_MS = 60000; // מרווח הערת שרת עמית (ברירת מחדל: כל דקה)
+const ACTIVE_INTERVAL_MS = 300000; // כל 5 דקות (5 * 60 * 1000 מ"ש)
+const IDLE_CHECK_MS = 60000;       // בדיקת שעון כל דקה בזמן חוסר פעילות
+
+if (!APPS_SCRIPT_URL && !PEER_WAKE_URL) {
+  console.error("Missing APPS_SCRIPT_URL or PEER_WAKE_URL environment variable");
+  process.exit(1);
+}
 
 function getIsraelMinutesSinceMidnight() {
   const parts = new Intl.DateTimeFormat("en-GB", {
@@ -22,11 +26,12 @@ function getIsraelMinutesSinceMidnight() {
   return hour * 60 + minute;
 }
 
-function isSlowMinuteSchedule() {
+// שעות שבהן אין קריאות ואין הערה מ-Render (עד 08:00 בבוקר)
+function isInactiveWindow() {
   const mins = getIsraelMinutesSinceMidnight();
 
-  // 01:00 (60) עד 08:30 (510)
-  const inNightWindow = mins >= 60 && mins < 510;
+  // 01:00 (60) עד 08:00 (480) — מתעורר וחוזר לפעול ב-08:00
+  const inNightWindow = mins >= 60 && mins < 480;
 
   // 09:30 (570) עד 13:00 (780)
   const inMorningWindow = mins >= 570 && mins < 780;
@@ -37,14 +42,8 @@ function isSlowMinuteSchedule() {
   return inNightWindow || inMorningWindow || inEveningWindow;
 }
 
-function getCurrentIntervalMs() {
-  return isSlowMinuteSchedule() ? SLOW_INTERVAL_MS : FAST_INTERVAL_MS;
-}
-
 async function runProcessChatRequests() {
-  if (!APPS_SCRIPT_URL) {
-    return;
-  }
+  if (!APPS_SCRIPT_URL) return;
 
   try {
     const res = await fetch(APPS_SCRIPT_URL, {
@@ -59,9 +58,7 @@ async function runProcessChatRequests() {
 }
 
 async function wakePeerServer() {
-  if (!PEER_WAKE_URL) {
-    return;
-  }
+  if (!PEER_WAKE_URL) return;
 
   try {
     const res = await fetch(PEER_WAKE_URL, {
@@ -74,25 +71,15 @@ async function wakePeerServer() {
   }
 }
 
-async function mailLoop() {
-  if (APPS_SCRIPT_URL) {
-    await runProcessChatRequests();
-    const nextDelay = getCurrentIntervalMs();
-    console.log(
-      new Date().toISOString(),
-      "[SCHEDULE] Next mail poll in",
-      nextDelay / 1000,
-      "sec"
-    );
-    setTimeout(mailLoop, nextDelay);
+async function activeTick() {
+  if (isInactiveWindow()) {
+    console.log(new Date().toISOString(), "[IDLE] Inactive window - no mail/wake calls");
+    setTimeout(activeTick, IDLE_CHECK_MS);
+    return;
   }
-}
 
-async function wakeLoop() {
-  if (PEER_WAKE_URL) {
-    await wakePeerServer();
-    setTimeout(wakeLoop, WAKE_PEER_INTERVAL_MS);
-  }
+  await Promise.all([runProcessChatRequests(), wakePeerServer()]);
+  setTimeout(activeTick, ACTIVE_INTERVAL_MS);
 }
 
 http
@@ -102,10 +89,5 @@ http
   })
   .listen(PORT, () => {
     console.log("Server listening on port", PORT);
-    if (APPS_SCRIPT_URL) {
-      mailLoop();
-    }
-    if (PEER_WAKE_URL) {
-      wakeLoop();
-    }
+    activeTick();
   });

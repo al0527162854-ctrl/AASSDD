@@ -5,8 +5,9 @@ const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL; // מוגדר בשרת הר
 const PEER_WAKE_URL = process.env.PEER_WAKE_URL;     // כתובת השרת השני בשרת הראשון, ולהפך
 const TIME_ZONE = "Asia/Jerusalem";
 
-const MAIL_INTERVAL_MS = 15000;      // כל 15 שניות בשרת הראשון
-const WAKE_INTERVAL_MS = 600000;     // כל 10 דקות בין השרתים
+const MAIL_INTERVAL_MS = 15000;      // כל 15 שניות בזמן פעילות
+const WAKE_INTERVAL_MS = 600000;     // כל 10 דקות בין השרתים בזמן פעילות
+const IDLE_CHECK_MS = 60000;         // בדיקת שעון כל דקה בזמן חלון רדום
 
 if (!APPS_SCRIPT_URL && !PEER_WAKE_URL) {
   console.error("Missing APPS_SCRIPT_URL or PEER_WAKE_URL environment variable");
@@ -24,6 +25,35 @@ function getIsraelClockString() {
     second: "2-digit",
     hour12: false
   }).format(new Date());
+}
+
+function getIsraelMinutesSinceMidnight() {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: TIME_ZONE,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }).formatToParts(new Date());
+
+  const hour = Number(parts.find((p) => p.type === "hour").value);
+  const minute = Number(parts.find((p) => p.type === "minute").value);
+  return hour * 60 + minute;
+}
+
+// שעות חוסר פעילות ("רדומות") — ללא קריאות וללא הערה הדדית
+function isInactiveWindow() {
+  const mins = getIsraelMinutesSinceMidnight();
+
+  // 01:00 (60) עד 08:00 (480)
+  const inNightWindow = mins >= 60 && mins < 480;
+
+  // 09:30 (570) עד 13:00 (780)
+  const inMorningWindow = mins >= 570 && mins < 780;
+
+  // 16:00 (960) עד 19:00 (1140)
+  const inEveningWindow = mins >= 960 && mins < 1140;
+
+  return inNightWindow || inMorningWindow || inEveningWindow;
 }
 
 async function runProcessChatRequests() {
@@ -55,16 +85,70 @@ async function wakePeerServer() {
   }
 }
 
+let mailTimer = null;
+let wakeTimer = null;
+let idleTimer = null;
+let loopsRunning = false;
+
+function clearScheduledTimers() {
+  if (mailTimer) clearTimeout(mailTimer);
+  if (wakeTimer) clearTimeout(wakeTimer);
+  if (idleTimer) clearTimeout(idleTimer);
+  mailTimer = null;
+  wakeTimer = null;
+  idleTimer = null;
+}
+
 async function mailLoop() {
-  if (!APPS_SCRIPT_URL) return;
+  if (!loopsRunning || !APPS_SCRIPT_URL || isInactiveWindow()) {
+    loopsRunning = false;
+    scheduleCoordinator();
+    return;
+  }
+
   await runProcessChatRequests();
-  setTimeout(mailLoop, MAIL_INTERVAL_MS);
+  if (!loopsRunning || isInactiveWindow()) {
+    loopsRunning = false;
+    scheduleCoordinator();
+    return;
+  }
+
+  mailTimer = setTimeout(mailLoop, MAIL_INTERVAL_MS);
 }
 
 async function wakeLoop() {
-  if (!PEER_WAKE_URL) return;
+  if (!loopsRunning || !PEER_WAKE_URL || isInactiveWindow()) {
+    loopsRunning = false;
+    scheduleCoordinator();
+    return;
+  }
+
   await wakePeerServer();
-  setTimeout(wakeLoop, WAKE_INTERVAL_MS);
+  if (!loopsRunning || isInactiveWindow()) {
+    loopsRunning = false;
+    scheduleCoordinator();
+    return;
+  }
+
+  wakeTimer = setTimeout(wakeLoop, WAKE_INTERVAL_MS);
+}
+
+function scheduleCoordinator() {
+  clearScheduledTimers();
+
+  if (isInactiveWindow()) {
+    loopsRunning = false;
+    console.log("[" + getIsraelClockString() + " IL] [IDLE] Inactive window - skipping mail & peer wake");
+    idleTimer = setTimeout(scheduleCoordinator, IDLE_CHECK_MS);
+    return;
+  }
+
+  if (!loopsRunning) {
+    loopsRunning = true;
+    console.log("[" + getIsraelClockString() + " IL] [ACTIVE] Starting active loops");
+    if (APPS_SCRIPT_URL) mailLoop();
+    if (PEER_WAKE_URL) wakeLoop();
+  }
 }
 
 http
@@ -74,10 +158,5 @@ http
   })
   .listen(PORT, () => {
     console.log("[" + getIsraelClockString() + " IL] Server listening on port", PORT);
-    if (APPS_SCRIPT_URL) {
-      mailLoop();
-    }
-    if (PEER_WAKE_URL) {
-      wakeLoop();
-    }
+    scheduleCoordinator();
   });

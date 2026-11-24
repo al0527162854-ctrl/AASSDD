@@ -1,162 +1,95 @@
 const http = require("http");
 
 const PORT = process.env.PORT || 3000;
-const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL; // מוגדר בשרת הראשון בלבד
-const PEER_WAKE_URL = process.env.PEER_WAKE_URL;     // כתובת השרת השני בשרת הראשון, ולהפך
+const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL;
 const TIME_ZONE = "Asia/Jerusalem";
 
-const MAIL_INTERVAL_MS = 15000;      // כל 15 שניות בזמן פעילות
-const WAKE_INTERVAL_MS = 600000;     // כל 10 דקות בין השרתים בזמן פעילות
-const IDLE_CHECK_MS = 60000;         // בדיקת שעון כל דקה בזמן חלון רדום
+const MAIL_INTERVAL_MS = 4500; // כל 4 שניות בזמן פעילות
+const IDLE_CHECK_MS = 60000;   // בדיקת שעון כל דקה בזמן חוסר פעילות
 
-if (!APPS_SCRIPT_URL && !PEER_WAKE_URL) {
-  console.error("Missing APPS_SCRIPT_URL or PEER_WAKE_URL environment variable");
+if (!APPS_SCRIPT_URL) {
+  console.error("Missing APPS_SCRIPT_URL environment variable");
   process.exit(1);
 }
 
-function getIsraelClockString() {
-  return new Intl.DateTimeFormat("en-GB", {
+function getIsraelTimeInfo() {
+  const now = new Date();
+  const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: TIME_ZONE,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
+    weekday: "short",
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
     hour12: false
-  }).format(new Date());
-}
+  }).formatToParts(now);
 
-function getIsraelMinutesSinceMidnight() {
-  const parts = new Intl.DateTimeFormat("en-GB", {
-    timeZone: TIME_ZONE,
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false
-  }).formatToParts(new Date());
-
-  const hour = Number(parts.find((p) => p.type === "hour").value);
+  const weekdayStr = parts.find((p) => p.type === "weekday").value; // Sun, Mon, Tue, Wed, Thu, Fri, Sat
+  const hour = Number(parts.find((p) => p.type === "hour").value) % 24;
   const minute = Number(parts.find((p) => p.type === "minute").value);
-  return hour * 60 + minute;
+  const second = Number(parts.find((p) => p.type === "second").value);
+
+  const dayMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+  const day = dayMap[weekdayStr];
+  const mins = hour * 60 + minute;
+
+  const clock = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:${String(second).padStart(2, "0")}`;
+  return { day, mins, clock };
 }
 
-// שעות חוסר פעילות ("רדומות") — ללא קריאות וללא הערה הדדית
-function isInactiveWindow() {
-  const mins = getIsraelMinutesSinceMidnight();
+// מחזיר true אם כרגע זמן מנוחה (לילה/הפסקות או שבת)
+function isInactiveTime() {
+  const { day, mins } = getIsraelTimeInfo();
 
-  // 01:00 (60) עד 08:00 (480)
-  const inNightWindow = mins >= 60 && mins < 480;
+  // 1. שמירת שבת: מיום שישי (5) בשעה 14:30 (870) עד מוצאי שבת (6) בשעה 20:30 (1230)
+  if (day === 5 && mins >= 870) return true;
+  if (day === 6 && mins < 1230) return true;
 
-  // 09:30 (570) עד 13:00 (780)
-  const inMorningWindow = mins >= 570 && mins < 780;
-
-  // 16:00 (960) עד 19:00 (1140)
-  const inEveningWindow = mins >= 960 && mins < 1140;
+  // 2. חלונות חוסר פעילות יומיים:
+  const inNightWindow = mins >= 60 && mins < 480;     // 01:00 עד 08:00
+  const inMorningWindow = mins >= 570 && mins < 780;  // 09:30 עד 13:00
+  const inEveningWindow = mins >= 960 && mins < 1140; // 16:00 עד 19:00
 
   return inNightWindow || inMorningWindow || inEveningWindow;
 }
 
 async function runProcessChatRequests() {
-  if (!APPS_SCRIPT_URL) return;
-
   try {
     const res = await fetch(APPS_SCRIPT_URL, {
       method: "GET",
       redirect: "follow"
     });
     const body = await res.text();
-    console.log("[" + getIsraelClockString() + " IL] [MAIL] Status:", res.status, body);
+    const { clock } = getIsraelTimeInfo();
+    console.log(`[${clock} IL] [MAIL] Status: ${res.status} | ${body}`);
   } catch (err) {
-    console.error("[" + getIsraelClockString() + " IL] [MAIL] Error:", err.message);
+    const { clock } = getIsraelTimeInfo();
+    console.error(`[${clock} IL] [MAIL] Error: ${err.message}`);
   }
 }
 
-async function wakePeerServer() {
-  if (!PEER_WAKE_URL) return;
+async function mainLoop() {
+  const { clock } = getIsraelTimeInfo();
 
-  try {
-    const res = await fetch(PEER_WAKE_URL, {
-      method: "GET",
-      redirect: "follow"
-    });
-    console.log("[" + getIsraelClockString() + " IL] [WAKE] Peer status:", res.status);
-  } catch (err) {
-    console.error("[" + getIsraelClockString() + " IL] [WAKE] Peer error:", err.message);
-  }
-}
-
-let mailTimer = null;
-let wakeTimer = null;
-let idleTimer = null;
-let loopsRunning = false;
-
-function clearScheduledTimers() {
-  if (mailTimer) clearTimeout(mailTimer);
-  if (wakeTimer) clearTimeout(wakeTimer);
-  if (idleTimer) clearTimeout(idleTimer);
-  mailTimer = null;
-  wakeTimer = null;
-  idleTimer = null;
-}
-
-async function mailLoop() {
-  if (!loopsRunning || !APPS_SCRIPT_URL || isInactiveWindow()) {
-    loopsRunning = false;
-    scheduleCoordinator();
+  if (isInactiveTime()) {
+    console.log(`[${clock} IL] [IDLE] Inactive/Shabbat window - sleeping...`);
+    setTimeout(mainLoop, IDLE_CHECK_MS);
     return;
   }
 
   await runProcessChatRequests();
-  if (!loopsRunning || isInactiveWindow()) {
-    loopsRunning = false;
-    scheduleCoordinator();
-    return;
-  }
-
-  mailTimer = setTimeout(mailLoop, MAIL_INTERVAL_MS);
-}
-
-async function wakeLoop() {
-  if (!loopsRunning || !PEER_WAKE_URL || isInactiveWindow()) {
-    loopsRunning = false;
-    scheduleCoordinator();
-    return;
-  }
-
-  await wakePeerServer();
-  if (!loopsRunning || isInactiveWindow()) {
-    loopsRunning = false;
-    scheduleCoordinator();
-    return;
-  }
-
-  wakeTimer = setTimeout(wakeLoop, WAKE_INTERVAL_MS);
-}
-
-function scheduleCoordinator() {
-  clearScheduledTimers();
-
-  if (isInactiveWindow()) {
-    loopsRunning = false;
-    console.log("[" + getIsraelClockString() + " IL] [IDLE] Inactive window - skipping mail & peer wake");
-    idleTimer = setTimeout(scheduleCoordinator, IDLE_CHECK_MS);
-    return;
-  }
-
-  if (!loopsRunning) {
-    loopsRunning = true;
-    console.log("[" + getIsraelClockString() + " IL] [ACTIVE] Starting active loops");
-    if (APPS_SCRIPT_URL) mailLoop();
-    if (PEER_WAKE_URL) wakeLoop();
-  }
+  
+  // בדיקה נוספת לפני תזמון הריצה הבאה למקרה שנכנסנו כרגע לחלון שינה
+  const nextDelay = isInactiveTime() ? IDLE_CHECK_MS : MAIL_INTERVAL_MS;
+  setTimeout(mainLoop, nextDelay);
 }
 
 http
   .createServer((req, res) => {
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-    res.end("OK");
+    res.end("OK - Active");
   })
   .listen(PORT, () => {
-    console.log("[" + getIsraelClockString() + " IL] Server listening on port", PORT);
-    scheduleCoordinator();
+    const { clock } = getIsraelTimeInfo();
+    console.log(`[${clock} IL] Server listening on port ${PORT}`);
+    mainLoop();
   });

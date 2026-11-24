@@ -4,7 +4,7 @@ const PORT = process.env.PORT || 3000;
 const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL;
 const TIME_ZONE = "Asia/Jerusalem";
 
-const MAIL_INTERVAL_MS = 4500; // כל 4 שניות בזמן פעילות
+const MAIL_INTERVAL_MS = 8500; // כל 4 שניות בזמן פעילות
 const IDLE_CHECK_MS = 60000;   // בדיקת שעון כל דקה בזמן חוסר פעילות
 
 if (!APPS_SCRIPT_URL) {
